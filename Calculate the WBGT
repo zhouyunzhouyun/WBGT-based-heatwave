@@ -1,0 +1,352 @@
+var geometry = ee.FeatureCollection("users/zhouyunwaterjun/basicpolygon/heatwave_province" )
+
+// var geometry = provinces.filter(ee.Filter.eq('Name','Chongqing')) 
+
+// var geometry = provinces.filter('Name == "Chongqing" || ' +
+//                             'Name == "Sichuan" || ' +
+//                             'Name == "Yunnan"');   
+
+
+// Define start and end dates. -------数据筛选 
+var start = '1980-05-01';
+var end = '1999-09-30';
+
+// var start = '2000-05-01';
+// var end = '2019-09-30';
+
+
+var startDoy = ee.Date('2000-05-01').getRelative('day', 'year');
+var endDoy = ee.Date('2000-09-30').getRelative('day', 'year');
+
+// Select all images with the months of April to July with a date range.
+var col = ee.ImageCollection("ECMWF/ERA5/DAILY")
+  .filterDate(start, end)
+  .filter(ee.Filter.calendarRange(startDoy, endDoy, 'day_of_year'))
+  .filterBounds(geometry)
+  // .select("dewpoint_2m_temperature")
+  .select(["dewpoint_2m_temperature","surface_pressure","mean_2m_air_temperature"])
+  
+
+print(col)
+
+//------------------------------------计算相对湿度 
+//https://www.omnicalculator.com/physics/relative-humidity#how-to-use-the-relative-humidity-calculator
+// RH = 100 × {exp[17.625 × Dp/(243.04 + Dp)]/exp[17.625 × T/(243.04 + T)]}
+//Measure the air temperature T, in °C. Find out the dew point temperature Dp, in °C.
+//Temperature measured in kelvin can be converted to degrees Celsius (°C) by subtracting 273.15.
+
+function RH2_value(img){
+  var RH2_img = img.select(["dewpoint_2m_temperature","mean_2m_air_temperature"])
+      RH2_img = RH2_img.expression(
+    '100 * (exp(17.625 * (Dp-273.15)/(243.04 + (Dp-273.15)))/exp(17.625 * (T-273.15)/(243.04 +(T-273.15))))', {
+     'Dp':RH2_img.select('dewpoint_2m_temperature'),
+      'T':RH2_img.select('mean_2m_air_temperature')
+    }).rename("RH2")
+      return img.addBands(RH2_img)}
+      
+var col_RH = col.map(function(image){
+  return RH2_value(image);
+})
+
+print(col_RH, 'With RH2_img as Band');
+
+//----------------------------------K 到 F 温度转换
+// convert 300 K to °F: 300 K = 300 × 9/5 - 459.67 = 80.33 °F   T*9/5-459.67
+function F_value(img){
+  var F_img = img.select(["mean_2m_air_temperature"])
+      F_img = F_img.expression(
+    'T*9/5-459.67', {
+     'T':F_img.select('mean_2m_air_temperature')
+    }).rename("F")
+      return img.addBands(F_img)}
+      
+var col_F = col_RH.map(function(image){
+  return F_value(image);
+});
+
+print(col_F, 'With F_img as Band');
+
+//ee.Algorithms.If(condition, trueCase, falseCase)  
+// HI = (0.5 * ({T + 61.0 + [(T-68.0)*1.2] + (RH*0.094)} + T)/2  
+//首先计算简单的公式，然后将结果与温度取平均值。
+//如果这个热指数值为80华氏度或更高，则采用完整的回归方程以及上述的任何调整。
+function HI_if_value(img){
+  var HI_if_img = img.select(["RH2","F"])
+      HI_if_img = HI_if_img.expression(
+    '(0.5 * (T + 61.0 + ((T-68.0)*1.2)+(RH*0.094))+ T)/2', {
+     'RH':HI_if_img.select('RH2'),
+      'T':HI_if_img.select('F')
+    }).rename("HI_if")
+      return img.addBands(HI_if_img)}
+
+var col_HI_if = col_F.map(function(image){
+  return HI_if_value(image);
+});
+print(col_HI_if, 'With HI_if_img as Band');
+
+// --------------------------------------均值小于80
+
+function condition_lt80(image){ 
+  var mask = image.select('HI_if').lt(80)
+     return  image = image.updateMask(mask)}
+      
+var col_HI_lt80 = col_HI_if.map(function(image){
+  return condition_lt80(image);
+});
+
+
+function HI2_value(img){
+  var HI2_img = img.select(["RH2","F"])
+      HI2_img = HI2_img.expression(
+    '0.5 * (T + 61.0 + ((T-68.0)*1.2)+(RH*0.094))', {
+     'RH':HI2_img.select('RH2'),
+      'T':HI2_img.select('F')
+    }).rename("HI2")
+      return img.addBands(HI2_img)}
+
+var col_HI_lt80 = col_HI_lt80.map(function(image){
+  return HI2_value(image);
+});
+// print(col_HI_lt80, 'With HI_lt80_img as Band');      
+    
+
+//----------------------------------------均值大于80
+
+
+function condition_gt80(image){ 
+  var mask = image.select('HI_if').gte(80)
+     return  image = image.updateMask(mask)}
+     
+var col_HI_gt80 = col_HI_if.map(function(image){
+  return condition_gt80(image);
+});
+
+// HI = -42.379 + 2.04901523*T + 10.14333127*RH - .22475541*T*RH - .00683783*T*T - .05481717*RH*RH + .00122874*T*T*RH + .00085282*T*RH*RH - .00000199*T*T*RH*RH
+// where T is temperature in degrees F and RH is relative humidity in percent.  
+function HI_value(img){
+  var HI_img = img.select(["RH2","F"])
+      HI_img = HI_img.expression(
+    '-42.379 + 2.04901523*T + 10.14333127*RH - 0.22475541*T*RH - 0.00683783*T*T - 0.05481717*RH*RH + 0.00122874*T*T*RH + 0.00085282*T*RH*RH - 0.00000199*T*T*RH*RH', {
+     'RH':HI_img.select('RH2'),
+      'T':HI_img.select('F')
+    }).rename("HI")
+      return img.addBands(HI_img)}
+      
+var col_HI_gt80 = col_HI_gt80.map(function(image){
+  return HI_value(image);
+});
+
+// print(col_HI_gt80, 'With HI_gt80_img as Band');
+
+//----------------------------------------湿度小于13 
+// If the RH is less than 13% and the temperature is between 80 and 112 degrees F, then the following adjustment is subtracted from HI:
+//	ADJUSTMENT = [(13-RH)/4]*SQRT{[17-ABS(T-95.)]/17}
+
+function adjust1_value(img){
+ 
+  var adjust1_img = img.select(["RH2","F"])
+      adjust1_img = adjust1_img.expression(
+    ' ((13-RH)/4)*sqrt((17-abs(T-95))/17)', {
+     'RH':adjust1_img.select('RH2'),
+      'T':adjust1_img.select('F')
+    }).rename("adjust1")
+      return img.addBands(adjust1_img)}  //img.subtract(adjust1)
+      
+var col_RH_lt13 = col_F.map(function(image){
+  return adjust1_value(image);
+});
+
+function condition_RH_lt13(image){ 
+  var mask = image.select('RH2').lt(13)
+         .and(image.select('F').gt(80))
+         .and(image.select('F').lt(112))
+              image = image.updateMask(mask)
+   return     image = image.unmask(0)}
+    
+var col_RH_lt13 = col_RH_lt13.map(function(image){
+  return  condition_RH_lt13(image);
+});
+Map.addLayer(col_RH_lt13.select(["adjust1"]).first(), {}, 'adjust1');
+
+//----------------------------------------湿度大于85-----------------
+// If the RH is greater than 85% and the temperature is between 80 and 87 degrees F, then the following adjustment is added to HI:
+// ADJUSTMENT = [(RH-85)/10] * [(87-T)/5]
+
+function adjust2_value(img){
+  var adjust2_img = img.select(["RH2","F"])
+      adjust2_img = adjust2_img.expression(
+    ' ((RH-85)/10) * ((87-T)/5)', {
+     'RH':adjust2_img.select('RH2'),
+      'T':adjust2_img.select('F')
+    }).rename("adjust2")
+      return img.addBands(adjust2_img)}
+      
+var col_RH_gt85 = col_F.map(function(image){
+  return adjust2_value(image);
+});
+
+function condition_RH_gt85(image){ 
+  var mask = image.select('RH2').gt(85)
+         .and(image.select('F').gt(80))
+         .and(image.select('F').lt(87))
+          image = image.updateMask(mask)
+   return image = image.unmask(0)}
+    
+var col_RH_gt85 = col_RH_gt85.map(function(image){
+  return  condition_RH_gt85(image);
+});
+
+Map.addLayer(col_RH_gt85.select(["adjust2"]).first(), {}, 'adjust2');
+
+//-------------------------------------combine HI and fill mask
+
+var col_HI_gt80 = col_HI_gt80.select("HI")
+
+var col_HI_lt80 = col_HI_lt80.select("HI2")
+
+var col_HI  = col_HI_gt80.combine(col_HI_lt80)
+
+print(col_HI,"col_HI")
+
+//------------------------------------
+
+function unmask(image){ 
+  
+
+  var  m1 = image.select('HI')
+       
+  var  m2 = image.select("HI2") 
+        
+  var  image = m1.unmask(m2).rename("fill")
+     
+     return image}
+           
+var col_HI_all = col_HI.map(function(image){
+  return unmask(image);
+});
+
+print(col_HI_all,"col_all")
+
+Map.addLayer(col_HI_all.select(["fill"]).first(), {}, 'fill');
+
+
+//-------------------------------------------------
+
+var col_adjust2 = col_RH_gt85.select("adjust2")
+
+var col_adjust1 = col_RH_lt13.select("adjust1")
+
+var col_adjust = col_adjust2.combine(col_adjust1)
+
+Map.addLayer(col_adjust.select(["adjust1"]).first(), {}, 'adjust1');
+
+var col_fill = col_HI_all.select("fill")
+
+var col = col_fill.combine(col_adjust)
+
+print(col,"col")
+
+//==================================
+
+function adjusted_HI_value(img){
+  var adjusted_HI_img = img.select(["fill","adjust1","adjust2"])
+      adjusted_HI_img = adjusted_HI_img.expression(
+    ' (HI-A1+A2)', {
+    'HI':adjusted_HI_img.select('fill'),
+    'A1':adjusted_HI_img.select('adjust1'),
+    'A2':adjusted_HI_img.select('adjust2')
+    }).rename("final_HI")
+      return img.addBands(adjusted_HI_img)}
+      
+var final_HI = col.map(function(image){
+  return adjusted_HI_value(image);
+});
+
+
+print(final_HI,"col_adjusted_HI")
+
+// Map.addLayer(final_HI.select(["final_HI"]).first(), {}, 'final_HI');
+//----------------------------//
+
+//WBGTmax ( ) °C = −0.0034HImax 2( ) °F + 0.96HImax ( ) °F − 34
+
+// var final_HI = final_HI.select(["final_HI"])
+
+// Map.addLayer(final_HI.first(), {}, 'final_HI');
+
+// var ROI = ee.FeatureCollection("users/zhouyunwaterjun/basicpolygon/province" )
+
+
+// //输出影像的函数   
+// Export.image.toDrive({
+//     image: final_HI.first(),
+//     description: "final_HI",
+//     // fileNamePrefix: "col_HI_gt80_HI",
+//     folder: "batch-WBGT",
+//     scale: 11132,
+//     region: ROI,
+//     maxPixels: 1e13,
+//     crs: "EPSG:4326"
+//   });
+
+
+function WBGT_value(img){
+  var WBGT_img = img.select(["final_HI"])
+      WBGT_img = WBGT_img.expression(
+    ' (0.96*HI-0.0034*HI*HI-34)', {
+    'HI':WBGT_img.select('final_HI'),
+          }).rename("WBGT")
+      return img.addBands(WBGT_img)}
+
+var WBGT = final_HI.map(function(image){
+  return WBGT_value(image);
+});
+
+print(WBGT, 'With WBGT_img as Band');  
+
+//---------------------------------export wgbt data 
+
+var vis2 = {
+  min: 0,
+  max: 45,
+  palette: [
+    '#000080', '#0000D9', '#4000FF', '#8000FF', '#0080FF', '#00FFFF', '#00FF80',
+    '#80FF00', '#DAFF00', '#FFFF00', '#FFF500', '#FFDA00', '#FFB000', '#FFA400',
+    '#FF4F00', '#FF2500', '#FF0A00', '#FF00FF'
+  ]
+};
+
+ 
+var image = WBGT.first().select("WBGT")
+
+Map.addLayer(image, vis2, 'WBGT');
+
+var ROI = ee.FeatureCollection("users/zhouyunwaterjun/basicpolygon/heatwave_province" )
+
+// var indexlist = geometry.reduceColumns(ee.Reducer.toList(),["Name"])
+//                           .get("list")
+// print(indexlist )
+                           
+// indexlist.evaluate(function(indexs){
+//   for (var i=0;i<indexs.length;i++){
+//       var l9Chart = ui.Chart.image.series({imageCollection: WBGT.select(['WBGT']),
+//   region: geometry.filter(ee.Filter.eq('Name',indexs[i])) ,
+//   reducer: ee.Reducer.percentile([100])}
+// ).setChartType('ScatterChart');
+
+
+// print(indexs[i],l9Chart);
+//   }
+// });
+
+
+
+
+// var l9Chart = ui.Chart.image.series({imageCollection: WBGT.select(['WBGT']),
+//   region: geometry.filter(ee.Filter.eq('CNAME',"山西省")),
+//   reducer: ee.Reducer.max()}
+// ).setChartType('ScatterChart');
+
+
+// print(l9Chart);
+
